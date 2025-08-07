@@ -62,6 +62,7 @@ version = "0.1.0"
 dependencies = [
  "common",
  "crossbeam",
+ "crossbeam-channel",
  "tokio",
  "wg_internal",
 ]
@@ -69,8 +70,10 @@ dependencies = [
 [[package]]
 name = "common"
 version = "0.1.0"
-source = "git+https://github.com/RustDoIt/common.git#e76c94ee72d2e5c0b6864e3bf18c47e45f4b6062"
+source = "git+https://github.com/RustDoIt/common.git#e5285fdd42b4601a43869360698efb8f429867a1"
 dependencies = [
+ "crossbeam-channel",
+ "tokio",
  "wg_internal",
 ]
 
