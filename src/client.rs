@@ -1,99 +1,125 @@
-use wg_internal::network:: NodeId ;
-use std::sync::Arc;
-use wg_internal::packet::{ NackType, NodeType, Packet, PacketType};
-use crossbeam_channel::{ Sender, Receiver };
 use std::collections::HashMap;
-use common::network::{Network, Node};
-use common::types::{PendingQueue, SendingMap, NodeEvent, NodeCommand};
-use tokio::sync::{Mutex, RwLock};
-use crossbeam_channel::select_biased;
+use common::{types::{NodeCommand, NodeEvent}, routing_handler::RoutingHandler};
+use crossbeam_channel::{select_biased, Receiver, Sender};
+use wg_internal::{network::NodeId, packet::{Nack, NackType, NodeType, Packet, PacketType}};
+use crate::errors::ClientError;
 
 
-pub struct Client {
-    neighbors: SendingMap,
+#[derive(Debug)]
+pub enum ClientType {
+    ChatClient,
+    WebBrowser
+}
+
+/// Events from client to simulation controller
+#[derive(Debug)]
+pub enum ClientEvent {
+    PacketSent(Packet),
+    ClientRegistered(String),
+    MessageSent(NodeId, String), // (to, message)
+}
+
+
+pub(crate) struct Client {
     id: NodeId,
-    network_view: Arc<RwLock<Network>>,
-    last_discovery: u64,
-    flood_id: u64,
-    session_id: u64,
-    pending: PendingQueue,
-    controller_send: Sender<NodeEvent>,
-    controller_recv: Receiver<NodeCommand>,
     packet_recv: Receiver<Packet>,
+    controller_recv: Receiver<NodeCommand>,
+    routing_handler: RoutingHandler
 }
 
 
 impl Client {
-    pub fn new(id: NodeId, controller_send: Sender<NodeEvent>, controller_recv: Receiver<NodeCommand>, packet_recv: Receiver<Packet>) -> Self {
-        let pending = Arc::new(Mutex::new(HashMap::new()));
+    pub(crate) fn new(
+        id: NodeId,
+        neighbors: HashMap<NodeId, Sender<Packet>>,
+        packet_recv: Receiver<Packet>,
+        controller_recv: Receiver<NodeCommand>,
+        controller_send: Sender<NodeEvent>,
+    ) -> Self {
         Self {
             id,
-            neighbors: Arc::new(RwLock::new(HashMap::new())),
-            network_view: Arc::new(RwLock::new(Network::new(Node::new(id, NodeType::Client, vec![])))),
-            session_id: 0,
-            last_discovery: 0,
-            flood_id: 0,
-            pending,
-            controller_send,
+            packet_recv,
             controller_recv,
-            packet_recv
+            routing_handler: RoutingHandler::new(id, NodeType::Client, neighbors, controller_send)
         }
     }
 
-    pub async fn run(&mut self) {
+    pub(crate) fn start(&mut self) -> Result<(), ClientError>{
+        // start first discovery
+        self.routing_handler.start_flood().map_err(|_e| ClientError::NetworkError(("Cannot Start flood").to_string()))?;
+
         loop {
             select_biased! {
                 recv(self.controller_recv) -> command => {
                     if let Ok(command) = command {
-                        if matches!(command, NodeCommand::AddSender(_, _)) {
-                            let (node_id, sender) = command.as_add_sender().unwrap();
-                            self.neighbors.write().await.insert(node_id, sender);
+                        // handle command
+                        match command {
+                            NodeCommand::AddSender(node_id, sender) => {
+                                let _ = self.routing_handler.add_neighbor(node_id, sender);
+                            },
+                            NodeCommand::RemoveSender(node_id) => {
+                                let _ = self.routing_handler.remove_neighbor(node_id);
+                            },
+                            NodeCommand::Shutdown => break,
                         }
-                        Network::discover(
-                            self.network_view.clone(),
-                            self.id,
-                            self.neighbors.clone(),
-                            self.session_id,
-                            self.flood_id,
-                            self.pending.clone()
-                        );
-                        self.last_discovery = self.session_id;
-                        self.flood_id += 1;
-                        self.session_id += 1;
                     }
                 },
 
                 recv(self.packet_recv) -> packet => {
                     if let Ok(packet) = packet {
+                        // handle packet
                         match packet.pack_type {
-                            PacketType::Ack(_) => {},
-                            PacketType::Nack(nack) => {
-                                match nack.nack_type {
-                                    NackType::ErrorInRouting(_) => todo!(),
-                                    NackType::DestinationIsDrone => todo!(),
-                                    NackType::Dropped => todo!(),
-                                    NackType::UnexpectedRecipient(node_id) => {
-                                        let _ = self.network_view.write().await.remove_node(node_id);
-                                        let _ = self.controller_send.send(NodeEvent::NodeRemoved(node_id));
-                                    },
-                                }
+                            PacketType::MsgFragment(fragment) => todo!(),
+                            PacketType::Ack(ack) => todo!(),
+                            PacketType::Nack(nack) => self.handle_nack(nack),
+                            PacketType::FloodRequest(flood_request) => {
+                                let _ = self.routing_handler.handle_flood_request(flood_request, packet.session_id);
                             },
-                            PacketType::MsgFragment(f) => {}
-                            PacketType::FloodRequest(flood_request) => {},
                             PacketType::FloodResponse(flood_response) => {
-                                let mut lock = self.pending.lock().await;
-                                if let Some(tx) = lock.remove(&self.last_discovery) {
-                                    let _ = tx.send(PacketType::FloodResponse(flood_response));
-                                }
-
-                            }
-
+                                let _ = self.routing_handler.handle_flood_response(flood_response);
+                            },
                         }
                     }
                 }
-
             }
+        }
+
+        Ok(())
+    }
+
+    fn handle_nack(&mut self, nack: Nack) {
+        match nack.nack_type {
+            NackType::ErrorInRouting(_node_id) => {
+                // Drone crashed --> forward to routing handler
+                self.routing_handler.start_flood();
+            },
+            NackType::DestinationIsDrone => todo!(),
+            NackType::Dropped => todo!(),
+            NackType::UnexpectedRecipient(_) => todo!(),
         }
     }
 }
 
+
+pub struct ChatClient {
+    client: Client,
+    received_messages: Vec<(String, String)>,
+    communication_server: Vec<NodeId>
+}
+
+
+impl ChatClient {
+    pub fn new(
+        id: NodeId,
+        neighbors: HashMap<NodeId, Sender<Packet>>,
+        packet_recv: Receiver<Packet>,
+        controller_recv: Receiver<NodeCommand>,
+        controller_send: Sender<NodeEvent>,
+    ) -> Self {
+        Self {
+            client: Client::new(id, neighbors, packet_recv, controller_recv, controller_send),
+            received_messages: vec![],
+            communication_server: vec![]
+        }
+    }
+}

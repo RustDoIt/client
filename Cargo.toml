@@ -9,3 +9,4 @@ wg_internal = { git = "https://github.com/WGL-2024/WGL_repo_2024.git", features 
 common = { git = "https://github.com/RustDoIt/common.git" }
 tokio = { version = "1.47.1", features = ["full"] }
 crossbeam-channel = "0.5.15"
+log = "0.4.27"
