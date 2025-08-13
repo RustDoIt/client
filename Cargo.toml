@@ -6,7 +6,10 @@ edition = "2024"
 [dependencies]
 crossbeam = "0.8.4"
 wg_internal = { git = "https://github.com/WGL-2024/WGL_repo_2024.git", features = ["debug"] }
-common = { git = "https://github.com/RustDoIt/common.git" }
+# common = { git = "https://github.com/RustDoIt/common.git" }
+common = { path = "../common" }
 tokio = { version = "1.47.1", features = ["full"] }
 crossbeam-channel = "0.5.15"
 log = "0.4.27"
+serde = { version = "1.0.219", features = ["derive"] }
+anyhow = "1.0.99"
