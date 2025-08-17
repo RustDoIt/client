@@ -1,114 +1,154 @@
-use std::{collections::HashMap, sync::Arc};
-use anyhow::Result;
-use common::RoutingHandler;
-use common::types::{NodeCommand, NodeEvent};
+use common::packet_processor::Processor;
+use common::types::{
+    ChatCommand, ChatEvent, ChatRequest, ChatResponse, Message, NodeCommand, ServerType,
+};
+use common::{FragmentAssembler, RoutingHandler};
 use crossbeam_channel::{Receiver, Sender};
-use serde::{Deserialize, Serialize};
-use tokio::{sync::Mutex, task::JoinHandle};
+use std::any::Any;
+use std::collections::{HashMap, HashSet};
+use wg_internal::packet::NodeType;
 use wg_internal::{network::NodeId, packet::Packet};
 
-use crate::client::{Client, Data, GenericClient};
-
-// Chat Protocol Messages according to AP-protocol.md
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(tag = "message_type")]
-pub enum ChatRequest {
-    #[serde(rename = "server_type?")]
-    ServerTypeQuery,
-
-    #[serde(rename = "registration_to_chat")]
-    RegistrationToChat { client_id: NodeId },
-
-    #[serde(rename = "client_list?")]
-    ClientListQuery,
-
-    #[serde(rename = "message_for?")]
-    MessageFor { client_id: NodeId, message: String },
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(tag = "response_type")]
-pub enum ChatResponse {
-    #[serde(rename = "server_type!")]
-    ServerTypeResponse { server_type: String },
-
-    #[serde(rename = "client_list!")]
-    ClientListResponse { list_of_client_ids: Vec<NodeId> },
-
-    #[serde(rename = "message_from!")]
-    MessageFrom { client_id: NodeId, message: String },
-
-    #[serde(rename = "error_wrong_client_id!")]
-    ErrorWrongClientId,
-
-    // Custom response for successful registration
-    #[serde(rename = "registration_success")]
-    RegistrationSuccess,
-}
-
 pub struct ChatClient {
-    client: Option<Client>,
-    routing_handler: Arc<Mutex<RoutingHandler>>,
-    received_messages: Vec<(String, String)>,
+    id: NodeId,
+    routing_handler: RoutingHandler,
     communication_server: Vec<NodeId>,
-    packet_processor: Option<JoinHandle<Result<()>>>
+    controller_recv: Receiver<Box<dyn Any>>,
+    controller_send: Sender<Box<dyn Any>>,
+    packet_recv: Receiver<Packet>,
+    assembler: FragmentAssembler,
+    connected_clients: HashSet<NodeId>,
+    communication_servers: HashSet<NodeId>,
+    chats_history: HashMap<NodeId, Vec<Message>>,
 }
 
 impl ChatClient {
+    #[must_use]
     pub fn new(
         id: NodeId,
         neighbors: HashMap<NodeId, Sender<Packet>>,
         packet_recv: Receiver<Packet>,
-        controller_recv: Receiver<NodeCommand>,
-        controller_send: Sender<NodeEvent>,
+        controller_recv: Receiver<Box<dyn Any>>,
+        controller_send: Sender<Box<dyn Any>>,
     ) -> Self {
-        let pending_messages = Arc::new(Mutex::new(Vec::<Data>::new()));
-        let pending_requests = Arc::new(Mutex::new(Vec::<(NodeId, Data)>::new()));
-        let client= Client::new(
-            id,
-            neighbors,
-            packet_recv,
-            controller_recv,
-            controller_send,
-            pending_messages,
-            pending_requests,
-        );
-        let routing_handler = client.routing_handler.clone();
+        let routing_handler =
+            RoutingHandler::new(id, NodeType::Client, neighbors, controller_send.clone());
 
         Self {
-            client: Some(client),
+            id,
             routing_handler,
-            received_messages: vec![],
             communication_server: vec![],
-            packet_processor: None
+            controller_recv,
+            controller_send,
+            packet_recv,
+            assembler: FragmentAssembler::default(),
+            connected_clients: HashSet::new(),
+            communication_servers: HashSet::new(),
+            chats_history: HashMap::new(),
+        }
+    }
 
+    fn get_chats_histories(&self) -> HashMap<NodeId, Vec<Message>> {
+        self.chats_history.clone()
+    }
+
+    fn get_connected_clients(&self) -> Vec<NodeId> {
+        self.connected_clients.iter().cloned().collect()
+    }
+
+    fn insert_message(&mut self, key: NodeId, message: Message) {
+        if let Some(chat) = self.chats_history.get_mut(&key) {
+            chat.push(message);
+        } else {
+            self.chats_history
+                .insert(key, vec![message]);
         }
     }
 }
-impl GenericClient for ChatClient {
-    fn get_available_requests() -> Vec<String> {
-        todo!()
+
+impl Processor for ChatClient {
+    fn controller_recv(&self) -> &Receiver<Box<dyn Any>> {
+        &self.controller_recv
     }
 
-    fn start(&mut self) -> Result<()> {
-        if let Some(client) = self.client.take() {
-            if let Some(processor) = client.run() {
-                self.packet_processor = Some(processor);
-            } else {
-                return Err(anyhow::anyhow!("Failed to start client"));
+    fn packet_recv(&self) -> &Receiver<Packet> {
+        &self.packet_recv
+    }
+
+    fn handle_command(&mut self, cmd: Box<dyn Any>) -> Result<(), ()> {
+        if let Some(cmd) = cmd.downcast_ref::<ChatCommand>() {
+            match cmd {
+                ChatCommand::GetChatsHistories => {
+                    let history = self.get_chats_histories();
+                    let _ = self
+                        .controller_send
+                        .send(Box::new(ChatEvent::ClientHistory(history)));
+                }
+                ChatCommand::GetConnectedClients => {
+                    let list = self.get_connected_clients();
+                    let _ = self
+                        .controller_send
+                        .send(Box::new(ChatEvent::ConnectedClients(list)));
+                }
+                ChatCommand::SendMessage(message) => {
+                    if let Ok(req) = serde_json::to_vec(&ChatRequest::MessageFor {
+                        client_id: message.to,
+                        message: message.text.clone(),
+                    }) {
+                        let _ = self.routing_handler.send_message(&req, message.to, None);
+                        let _ = self.controller_send.send(Box::new(ChatEvent::MessageSent));
+                        self.insert_message(message.to, message.clone());
+                    }
+                }
+            }
+        } else if let Some(cmd) = cmd.downcast_ref::<NodeCommand>() {
+            match cmd {
+                NodeCommand::AddSender(node_id, sender) => {
+                    self.routing_handler.add_neighbor(*node_id, sender.clone())
+                }
+                NodeCommand::RemoveSender(node_id) => {
+                    self.routing_handler.remove_neighbor(*node_id)
+                }
+                NodeCommand::Shutdown => {
+                    return Err(());
+                }
             }
         }
         Ok(())
     }
 
-    fn stop(&mut self) -> Result<()> {
-        if let Some(processor) = self.packet_processor.take() {
-            processor.abort();
-        }
-        Ok(())
+    fn assembler(&mut self) -> &mut FragmentAssembler {
+        &mut self.assembler
     }
 
-    fn send_request() {
-        todo!()
+    fn routing_header(&mut self) -> &mut RoutingHandler {
+        &mut self.routing_handler
+    }
+
+    fn handle_msg(&mut self, msg: Vec<u8>, _from: NodeId, _session_id: u64) {
+        if let Ok(msg) = serde_json::from_slice::<ChatResponse>(&msg) {
+            match msg {
+                ChatResponse::ServerType {
+                    server_id,
+                    server_type,
+                } => {
+                    if matches!(server_type, ServerType::ChatServer) {
+                        self.communication_servers.insert(server_id);
+                    }
+                }
+                ChatResponse::ClientList { list_of_client_ids } => {
+                    list_of_client_ids.iter().for_each(|id| {
+                        self.connected_clients.insert(*id);
+                    });
+                }
+                ChatResponse::MessageFrom { client_id, message } => {
+                    let received= Message::new(client_id, self.id, message);
+                    let _ = self.controller_send.send(Box::new(ChatEvent::MessageReceived(received.clone())));
+                    self.insert_message(client_id, received);
+                }
+                ChatResponse::ErrorWrongClientId => todo!(),
+                ChatResponse::RegistrationSuccess => {}
+            }
+        }
     }
 }
