@@ -12,12 +12,11 @@ use wg_internal::{network::NodeId, packet::Packet};
 pub struct ChatClient {
     id: NodeId,
     routing_handler: RoutingHandler,
-    communication_server: Vec<NodeId>,
     controller_recv: Receiver<Box<dyn Any>>,
     controller_send: Sender<Box<dyn Any>>,
     packet_recv: Receiver<Packet>,
     assembler: FragmentAssembler,
-    connected_clients: HashSet<NodeId>,
+    registered_clients: HashSet<NodeId>,
     communication_servers: HashSet<NodeId>,
     chats_history: HashMap<NodeId, Vec<Message>>,
 }
@@ -37,23 +36,22 @@ impl ChatClient {
         Self {
             id,
             routing_handler,
-            communication_server: vec![],
             controller_recv,
             controller_send,
             packet_recv,
             assembler: FragmentAssembler::default(),
-            connected_clients: HashSet::new(),
+            registered_clients: HashSet::new(),
             communication_servers: HashSet::new(),
             chats_history: HashMap::new(),
         }
     }
 
-    fn get_chats_histories(&self) -> HashMap<NodeId, Vec<Message>> {
+    fn get_chats_history(&self) -> HashMap<NodeId, Vec<Message>> {
         self.chats_history.clone()
     }
 
-    fn get_connected_clients(&self) -> Vec<NodeId> {
-        self.connected_clients.iter().cloned().collect()
+    fn get_registered_clients(&self) -> Vec<NodeId> {
+        self.registered_clients.iter().copied().collect()
     }
 
     fn insert_message(&mut self, key: NodeId, message: Message) {
@@ -75,20 +73,33 @@ impl Processor for ChatClient {
         &self.packet_recv
     }
 
-    fn handle_command(&mut self, cmd: Box<dyn Any>) -> Result<(), ()> {
+    fn assembler(&mut self) -> &mut FragmentAssembler {
+        &mut self.assembler
+    }
+
+    fn routing_handler(&mut self) -> &mut RoutingHandler {
+        &mut self.routing_handler
+    }
+
+    fn handle_command(&mut self, cmd: Box<dyn Any>) -> bool {
         if let Some(cmd) = cmd.downcast_ref::<ChatCommand>() {
             match cmd {
-                ChatCommand::GetChatsHistories => {
-                    let history = self.get_chats_histories();
-                    let _ = self
+                ChatCommand::GetChatsHistory => {
+                    let history = self.get_chats_history();
+                    if self
                         .controller_send
-                        .send(Box::new(ChatEvent::ClientHistory(history)));
+                        .send(Box::new(ChatEvent::ChatHistory(history))).is_err() {
+                            return true;
+                    }
                 }
-                ChatCommand::GetConnectedClients => {
-                    let list = self.get_connected_clients();
-                    let _ = self
+                ChatCommand::GetRegisteredClients => {
+                    let list = self.get_registered_clients();
+                    if self
                         .controller_send
-                        .send(Box::new(ChatEvent::ConnectedClients(list)));
+                        .send(Box::new(ChatEvent::RegisteredClients(list)))
+                        .is_err() {
+                            return true;
+                    }
                 }
                 ChatCommand::SendMessage(message) => {
                     if let Ok(req) = serde_json::to_vec(&ChatRequest::MessageFor {
@@ -96,7 +107,9 @@ impl Processor for ChatClient {
                         message: message.text.clone(),
                     }) {
                         let _ = self.routing_handler.send_message(&req, message.to, None);
-                        let _ = self.controller_send.send(Box::new(ChatEvent::MessageSent));
+                        if self.controller_send.send(Box::new(ChatEvent::MessageSent)).is_err() {
+                            return true;
+                        }
                         self.insert_message(message.to, message.clone());
                     }
                 }
@@ -104,26 +117,19 @@ impl Processor for ChatClient {
         } else if let Some(cmd) = cmd.downcast_ref::<NodeCommand>() {
             match cmd {
                 NodeCommand::AddSender(node_id, sender) => {
-                    self.routing_handler.add_neighbor(*node_id, sender.clone())
+                    self.routing_handler.add_neighbor(*node_id, sender.clone());
                 }
                 NodeCommand::RemoveSender(node_id) => {
-                    self.routing_handler.remove_neighbor(*node_id)
+                    self.routing_handler.remove_neighbor(*node_id);
                 }
                 NodeCommand::Shutdown => {
-                    return Err(());
+                    return true;
                 }
             }
         }
-        Ok(())
+        false
     }
 
-    fn assembler(&mut self) -> &mut FragmentAssembler {
-        &mut self.assembler
-    }
-
-    fn routing_header(&mut self) -> &mut RoutingHandler {
-        &mut self.routing_handler
-    }
 
     fn handle_msg(&mut self, msg: Vec<u8>, _from: NodeId, _session_id: u64) {
         if let Ok(msg) = serde_json::from_slice::<ChatResponse>(&msg) {
@@ -137,9 +143,9 @@ impl Processor for ChatClient {
                     }
                 }
                 ChatResponse::ClientList { list_of_client_ids } => {
-                    list_of_client_ids.iter().for_each(|id| {
-                        self.connected_clients.insert(*id);
-                    });
+                    for client in &list_of_client_ids {
+                        self.registered_clients.insert(*client);
+                    }
                 }
                 ChatResponse::MessageFrom { client_id, message } => {
                     let received= Message::new(client_id, self.id, message);

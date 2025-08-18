@@ -1,4 +1,4 @@
 #![allow(dead_code)]
-pub mod client;
+pub mod web_browser;
 pub mod chat_client;
 pub mod errors;
