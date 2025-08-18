@@ -131,15 +131,12 @@ impl Processor for ChatClient {
     }
 
 
-    fn handle_msg(&mut self, msg: Vec<u8>, _from: NodeId, _session_id: u64) {
+    fn handle_msg(&mut self, msg: Vec<u8>, from: NodeId, _session_id: u64) {
         if let Ok(msg) = serde_json::from_slice::<ChatResponse>(&msg) {
             match msg {
-                ChatResponse::ServerType {
-                    server_id,
-                    server_type,
-                } => {
+                ChatResponse::ServerType { server_type} => {
                     if matches!(server_type, ServerType::ChatServer) {
-                        self.communication_servers.insert(server_id);
+                        self.communication_servers.insert(from);
                     }
                 }
                 ChatResponse::ClientList { list_of_client_ids } => {

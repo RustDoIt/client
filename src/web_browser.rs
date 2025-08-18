@@ -1,24 +1,36 @@
-use std::{any::Any, collections::{HashMap, HashSet}};
+use std::{
+    any::Any,
+    collections::{
+        hash_map::Entry::Vacant,
+        HashMap,
+    },
+};
 
-use common::{FragmentAssembler, RoutingHandler, Processor, types::{TextFile, MediaFile}};
+use common::{
+    types::{MediaFile, ServerType, TextFile, WebRequest, WebResponse},
+    FragmentAssembler, Processor, RoutingHandler,
+};
 use crossbeam_channel::{Receiver, Sender};
-use wg_internal::{network::NodeId, packet::{NodeType, Packet}};
+use wg_internal::{
+    network::NodeId,
+    packet::{NodeType, Packet},
+};
 
-type Cache<'a> = HashMap<TextFile<'a>, Option<Vec<MediaFile>>>;
+type Cache = HashMap<TextFile, Option<Vec<MediaFile>>>;
 
 #[derive(Debug)]
-pub struct WebBrowser<'a>{
+pub struct WebBrowser {
     id: NodeId,
     routing_handler: RoutingHandler,
     controller_recv: Receiver<Box<dyn Any>>,
     controller_send: Sender<Box<dyn Any>>,
     packet_recv: Receiver<Packet>,
     assembler: FragmentAssembler,
-    text_servers: HashSet<NodeId>,
-    cached_files: Cache<'a>
+    text_servers: HashMap<NodeId, Vec<String>>,
+    cached_files: Cache,
 }
 
-impl WebBrowser<'_> {
+impl WebBrowser {
     #[must_use]
     pub fn new(
         id: NodeId,
@@ -37,14 +49,27 @@ impl WebBrowser<'_> {
             controller_send,
             packet_recv,
             assembler: FragmentAssembler::default(),
-            text_servers: HashSet::new(),
-            cached_files: HashMap::new()
+            text_servers: HashMap::new(),
+            cached_files: HashMap::new(),
+        }
+    }
+
+    fn get_text_servers(&self) -> Vec<NodeId> {
+        self.text_servers.keys().copied().collect()
+    }
+
+    fn get_list_files_by_id(&self, id: NodeId) -> Option<&Vec<String>> {
+        self.text_servers.get(&id)
+    }
+
+    fn set_files_list(&mut self, server_id: NodeId, list: Vec<String>) {
+        if let Vacant(e) = self.text_servers.entry(server_id) {
+            e.insert(list);
         }
     }
 }
 
-
-impl Processor for WebBrowser<'_> {
+impl Processor for WebBrowser {
     fn controller_recv(&self) -> &Receiver<Box<dyn Any>> {
         &self.controller_recv
     }
@@ -65,7 +90,36 @@ impl Processor for WebBrowser<'_> {
         todo!()
     }
 
-    fn handle_msg(&mut self, _msg: Vec<u8>, _from: NodeId, _session_id: u64) {
-        todo!()
+    fn handle_msg(&mut self, msg: Vec<u8>, from: NodeId, session_id: u64) {
+        if let Ok(msg) = serde_json::from_slice::<WebResponse>(&msg) {
+            match msg {
+                WebResponse::ServerType { server_type } => {
+                    if matches!(server_type, ServerType::TextServer) {
+                        self.text_servers.insert(from, vec![]);
+                    }
+                }
+                WebResponse::TextFilesList { files } => {
+                    self.set_files_list(from, files);
+                }
+                WebResponse::TextFile { file_data } => {
+                    if let Ok(file) = serde_json::from_slice::<TextFile>(&file_data) {
+                        for r in &file.get_refs() {
+                            if let Ok(req) = serde_json::to_vec(&WebRequest::MediaQuery {
+                                media_id: r.id.to_string(),
+                            }) {
+                                let _ = self.routing_handler.send_message(
+                                    &req,
+                                    r.get_location(),
+                                    Some(session_id),
+                                );
+                            }
+                        }
+                    }
+                }
+                WebResponse::MediaFile { media_data } => todo!(),
+                WebResponse::ErrorNotFound => todo!(),
+                WebResponse::ErrorUnsupportedRequest => todo!(),
+            }
+        }
     }
 }
