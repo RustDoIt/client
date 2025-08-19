@@ -155,3 +155,93 @@ impl Processor for ChatClient {
         }
     }
 }
+
+#[cfg(test)]
+mod chat_client_tests {
+    use super::*;
+    use crossbeam::channel::unbounded;
+    use common::types::{ChatResponse, ServerType, Message};
+
+    fn create_test_chat_client() -> ChatClient {
+        let (controller_send, controller_recv) = unbounded();
+        let (_, packet_recv) = unbounded();
+        let neighbors = HashMap::new();
+
+        ChatClient::new(1, neighbors, packet_recv, controller_recv, controller_send)
+    }
+
+    #[test]
+    /// Tests ServerType response handling (chat server being added to HashSet)
+    fn test_server_type_response_handling() {
+        let mut client = create_test_chat_client();
+
+        let response = ChatResponse::ServerType {
+            server_type: ServerType::ChatServer
+        };
+        let serialized = serde_json::to_vec(&response).unwrap();
+        client.handle_msg(serialized, 5, 100);
+
+        assert!(client.communication_servers.contains(&5));
+    }
+
+    #[test]
+    /// Tests ClientList response handling (chat client being added to HashSet)
+    fn test_client_list_response_handling() {
+        let mut client = create_test_chat_client();
+
+        let response = ChatResponse::ClientList {
+            list_of_client_ids: vec![10, 11, 12]
+        };
+        let serialized = serde_json::to_vec(&response).unwrap();
+        client.handle_msg(serialized, 5, 101);
+
+        assert_eq!(client.registered_clients.len(), 3);
+        assert!(client.registered_clients.contains(&10));
+        assert!(client.registered_clients.contains(&11));
+        assert!(client.registered_clients.contains(&12));
+    }
+
+    #[test]
+    /// Tests MessageFrom reception and storage in chat_history
+    fn test_message_reception_and_storage() {
+        let mut client = create_test_chat_client();
+
+        let response = ChatResponse::MessageFrom {
+            client_id: 20,
+            message: "Hello from client 20".to_string()
+        };
+        let serialized = serde_json::to_vec(&response).unwrap();
+        client.handle_msg(serialized, 5, 102);
+
+        assert!(client.chats_history.contains_key(&20));
+        let messages = client.chats_history.get(&20).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].from, 20);
+        assert_eq!(messages[0].to, 1);
+        assert_eq!(messages[0].text, "Hello from client 20".to_string());
+    }
+
+    #[test]
+    /// Tests GetRegisteredClients, GetChatsHistory and SendMessage commands handling
+    fn test_command_handling() {
+        let mut client = create_test_chat_client();
+
+        let cmd = ChatCommand::GetRegisteredClients;
+        let should_continue = client.handle_command(Box::new(cmd));
+        assert!(!should_continue);
+
+        client.registered_clients.insert(10);
+        client.registered_clients.insert(11);
+        let message = Message::new(1, 10, "Test message".to_string());
+        client.insert_message(10, message);
+
+        let cmd = ChatCommand::GetChatsHistory;
+        let should_continue = client.handle_command(Box::new(cmd));
+        assert!(!should_continue);
+
+        let message = Message::new(1, 10, "Outgoing message".to_string());
+        let cmd = ChatCommand::SendMessage(message);
+        let should_continue = client.handle_command(Box::new(cmd));
+        assert!(!should_continue);
+    }
+}
