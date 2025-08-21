@@ -4,7 +4,7 @@ use std::{
 };
 
 use common::{
-    types::{File, MediaFile, ServerType, TextFile, WebCommand, WebEvent, WebRequest, WebResponse},
+    types::{File, MediaFile, NodeCommand, ServerType, TextFile, WebCommand, WebEvent, WebRequest, WebResponse},
     FragmentAssembler, Processor, RoutingHandler,
 };
 use crossbeam_channel::{Receiver, Sender};
@@ -236,6 +236,18 @@ impl Processor for WebBrowser {
                     eprintln!("Unsupported command: {cmd:?}");
                     todo!()
                 }
+            }
+        } else if let Some(cmd) = cmd.downcast_ref::<NodeCommand>() {
+            match cmd {
+                NodeCommand::AddSender(node_id, sender) => {
+                    self.routing_handler.add_neighbor(*node_id, sender.clone());
+                    return false;
+                }
+                NodeCommand::RemoveSender(node_id) => {
+                    self.routing_handler.remove_neighbor(*node_id);
+                    return false;
+                }
+                NodeCommand::Shutdown => return true,
             }
         } else {
             false
