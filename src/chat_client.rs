@@ -171,7 +171,7 @@ mod chat_client_tests {
     }
 
     #[test]
-    /// Tests ServerType response handling (chat server being added to HashSet)
+    /// Tests `ServerType` response handling (chat server being added to `HashSet`)
     fn test_server_type_response_handling() {
         let mut client = create_test_chat_client();
 
@@ -185,7 +185,7 @@ mod chat_client_tests {
     }
 
     #[test]
-    /// Tests ClientList response handling (chat client being added to HashSet)
+    /// Tests `ClientList` response handling (chat client being added to `HashSet`)
     fn test_client_list_response_handling() {
         let mut client = create_test_chat_client();
 
@@ -202,7 +202,7 @@ mod chat_client_tests {
     }
 
     #[test]
-    /// Tests MessageFrom reception and storage in chat_history
+    /// Tests `MessageFrom` reception and storage in `chat_history`
     fn test_message_reception_and_storage() {
         let mut client = create_test_chat_client();
 
@@ -222,7 +222,7 @@ mod chat_client_tests {
     }
 
     #[test]
-    /// Tests GetRegisteredClients, GetChatsHistory and SendMessage commands handling
+    /// Tests `GetRegisteredClients`, `GetChatsHistory` and `SendMessage` commands handling
     fn test_command_handling() {
         let mut client = create_test_chat_client();
 

@@ -140,6 +140,68 @@ impl WebBrowser {
         }
         let _ = self.cached_files.insert(file, vec![]);
     }
+
+    fn try_send(&self, event: WebEvent) -> bool {
+        self.controller_send.send(Box::new(event)).is_err()
+    }
+
+    fn forward_request(&mut self, req: &WebRequest, uuid: Uuid) {
+        if let Ok(req) = serde_json::to_vec(req) {
+            if let Some(location) = self.locate_file(uuid) {
+                let _ = self.routing_handler.send_message(&req, location, None);
+            } else {
+                for location in self.text_servers.keys() {
+                    let _ = self.routing_handler.send_message(&req, *location, None);
+                }
+            }
+        }
+    }
+
+    fn handle_get_cached_files(&self) -> bool {
+        let files = self.get_files();
+        self.try_send(WebEvent::CachedFiles(files))
+    }
+
+    fn handle_get_file(&mut self, uuid: Uuid) -> bool {
+        if let Some(file) = self.get_file(uuid) {
+            return self.try_send(WebEvent::File(file));
+        }
+        self.forward_request(&WebRequest::FileQuery { file_id: uuid.to_string() }, uuid);
+        false
+    }
+
+    fn handle_get_text_files(&self) -> bool {
+        let files = self.cached_files.keys().cloned().collect::<Vec<_>>();
+        self.try_send(WebEvent::TextFiles(files))
+    }
+
+    fn handle_get_text_file(&mut self, uuid: Uuid) -> bool {
+        if let Some(file) = self.cached_files.keys().find(|f| f.id == uuid) {
+            return self.try_send(WebEvent::TextFile(file.clone()));
+        }
+        self.forward_request(&WebRequest::FileQuery { file_id: uuid.to_string() }, uuid);
+        false
+    }
+
+    fn handle_get_media_files(&self) -> bool {
+        let media: HashSet<_> = self.cached_files.values().flatten().cloned().collect();
+        self.try_send(WebEvent::MediaFiles(media.into_iter().collect()))
+    }
+
+    fn handle_get_media_file(&mut self, media_id: Uuid, location: NodeId) -> bool {
+        for v in self.cached_files.values() {
+            if let Some(media) = v.iter().find(|m| m.id == media_id) {
+                return self.try_send(WebEvent::MediaFile(media.clone()));
+            }
+        }
+
+        if let Ok(req) = serde_json::to_vec(&WebRequest::MediaQuery {
+            media_id: media_id.to_string(),
+        }) {
+            let _ = self.routing_handler.send_message(&req, location, None);
+        }
+        false
+    }
 }
 
 impl Processor for WebBrowser {
@@ -162,116 +224,22 @@ impl Processor for WebBrowser {
     fn handle_command(&mut self, cmd: Box<dyn Any>) -> bool {
         if let Some(cmd) = cmd.downcast_ref::<WebCommand>() {
             match cmd {
-                WebCommand::GetCachedFiles => {
-                    let files = self.get_files();
-                    if self
-                        .controller_send
-                        .send(Box::new(WebEvent::CachedFiles(files)))
-                        .is_err()
-                    {
-                        return true;
-                    }
-                }
-                WebCommand::GetFile(uuid) => {
-                    if let Some(file) = self.get_file(*uuid) {
-                        if self
-                            .controller_send
-                            .send(Box::new(WebEvent::File(file)))
-                            .is_err()
-                        {
-                            return true;
-                        }
-                    } else if let Ok(req) = serde_json::to_vec(&WebRequest::FileQuery {
-                        file_id: uuid.to_string(),
-                    }) {
-                        if let Some(location) = self.locate_file(*uuid) {
-                            // check if path to destination has been found else --> start_flood
-                            let _ = self.routing_handler.send_message(&req, location, None);
-                        } else {
-                            for (location, _) in &self.text_servers {
-                                // check if path to destination has been found else --> start_flood
-                                let _ = self.routing_handler.send_message(&req, *location, None);
-                            }
-                        }
-                    }
-                }
-                WebCommand::GetTextFiles => {
-                    let files = self.cached_files.keys().cloned().collect::<Vec<_>>();
-                    if self
-                        .controller_send
-                        .send(Box::new(WebEvent::TextFiles(files)))
-                        .is_err()
-                    {
-                        return true;
-                    }
-                }
-                WebCommand::GetTextFile(uuid) => {
-                    if let Some(file) = self.cached_files.keys().find(|f| f.id == *uuid) {
-                        if self
-                            .controller_send
-                            .send(Box::new(WebEvent::TextFile(file.clone())))
-                            .is_err()
-                        {
-                            return true;
-                        }
-                    } else if let Ok(req) = serde_json::to_vec(&WebRequest::FileQuery {
-                        file_id: uuid.to_string(),
-                    }) {
-                        if let Some(location) = self.locate_file(*uuid) {
-                            let _ = self.routing_handler.send_message(&req, location, None);
-                        } else {
-                            for (location, _) in &self.text_servers {
-                                let _ = self.routing_handler.send_message(&req, *location, None);
-                            }
-                        }
-                    }
-                }
-
-                WebCommand::GetMediaFiles => {
-                    let mut media = HashSet::new();
-                    for v in self.cached_files.values() {
-                        for m in v {
-                            media.insert(m.clone());
-                        }
-                    }
-
-                    let media = media.into_iter().collect();
-                    if self
-                        .controller_send
-                        .send(Box::new(WebEvent::MediaFiles(media)))
-                        .is_err()
-                    {
-                        return true;
-                    }
-                }
+                WebCommand::GetCachedFiles => self.handle_get_cached_files(),
+                WebCommand::GetFile(uuid) => self.handle_get_file(*uuid),
+                WebCommand::GetTextFiles => self.handle_get_text_files(),
+                WebCommand::GetTextFile(uuid) => self.handle_get_text_file(*uuid),
+                WebCommand::GetMediaFiles => self.handle_get_media_files(),
                 WebCommand::GetMediaFile { media_id, location } => {
-                    for v in self.cached_files.values() {
-                        if let Some(media) = v.iter().find(|m| m.id == *media_id) {
-                            if self
-                                .controller_send
-                                .send(Box::new(WebEvent::MediaFile(media.clone())))
-                                .is_err()
-                            {
-                                return true;
-                            }
-                            break;
-                        }
-                    }
-
-                    if let Ok(req) = serde_json::to_vec(&WebRequest::MediaQuery {
-                        media_id: media_id.to_string(),
-                    }) {
-                        let _ = self.routing_handler.send_message(&req, *location, None);
-                    }
+                    self.handle_get_media_file(*media_id, *location)
                 }
                 _ => {
-                    eprintln!("Unsupported command: {:?}", cmd);
+                    eprintln!("Unsupported command: {cmd:?}");
                     todo!()
                 }
             }
+        } else {
+            false
         }
-
-        false
     }
 
     fn handle_msg(&mut self, msg: Vec<u8>, from: NodeId, session_id: u64) {
@@ -322,7 +290,7 @@ mod web_browser_tests {
     }
 
     #[test]
-    /// Tests ServerType response handling (text server being added to HashSet)
+    /// Tests `ServerType` response handling (text server being added to `HashSet`)
     fn test_server_type_identification() {
         let mut browser = create_test_web_browser();
 
@@ -336,7 +304,7 @@ mod web_browser_tests {
     }
 
     #[test]
-    /// Tests TextFilesList response handling (server files list being added to HashSet)
+    /// Tests `TextFilesList` response handling (server files list being added to `HashSet`)
     fn test_text_files_list_handling() {
         let mut browser = create_test_web_browser();
 
@@ -353,7 +321,7 @@ mod web_browser_tests {
     }
 
     #[test]
-    /// Tests TextFile handling and caching
+    /// Tests `TextFile` handling and caching
     fn test_text_file_caching_with_media_refs() {
         let mut browser = create_test_web_browser();
 
@@ -376,7 +344,7 @@ mod web_browser_tests {
     }
 
     #[test]
-    /// Tests association between TextFile and Media File in File
+    /// Tests association between `TextFile` and `MediaFile` in `File`
     fn test_media_file_association() {
         let mut browser = create_test_web_browser();
 
