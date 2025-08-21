@@ -24,7 +24,7 @@ pub struct WebBrowser {
     controller_send: Sender<Box<dyn Any>>,
     packet_recv: Receiver<Packet>,
     assembler: FragmentAssembler,
-    text_servers: HashMap<NodeId, Vec<String>>,
+    text_servers: HashMap<NodeId, Vec<String>>, // id, file list
     cached_files: Cache,
 }
 
@@ -82,13 +82,20 @@ impl WebBrowser {
             .cloned()
     }
 
-    fn add_media_file(&mut self, media: MediaFile) {
-
-        let file = self.get_text_file_by_media_id(media.id);
-        if let Some(file) = file {
+    fn manage_media_file(&mut self, media: MediaFile) {
+        if let Some(file) = self.get_text_file_by_media_id(media.id) {
             if let Some(vec) = self.cached_files.get_mut(&file) {
                 vec.push(media);
+                if file.get_media_ids().len() == vec.len() {
+                    let _ = self
+                        .controller_send
+                        .send(Box::new(WebEvent::File(File::new(file, vec.clone()))));
+                }
             }
+        } else {
+            let _ = self
+                .controller_send
+                .send(Box::new(WebEvent::MediaFile(media)));
         }
     }
 
@@ -105,6 +112,33 @@ impl WebBrowser {
             return Some(File::new(tf.clone(), m.clone()));
         }
         None
+    }
+
+    fn locate_file(&self, uuid: Uuid) -> Option<NodeId> {
+        for (server, file_list) in &self.text_servers {
+            if file_list.contains(&uuid.to_string()) {
+                return Some(*server);
+            }
+        }
+        None
+    }
+
+    fn manage_text_file(&mut self, file: TextFile, session_id: u64) {
+        for r in &file.get_refs() {
+            if let Ok(req) = serde_json::to_vec(&WebRequest::MediaQuery {
+                media_id: r.id.to_string(),
+            }) {
+                let _ = self
+                    .routing_handler
+                    .send_message(&req, r.get_location(), Some(session_id));
+            }
+        }
+        if file.get_refs().is_empty() {
+            let _ = self
+                .controller_send
+                .send(Box::new(WebEvent::File(File::new(file.clone(), vec![]))));
+        }
+        let _ = self.cached_files.insert(file, vec![]);
     }
 }
 
@@ -147,6 +181,18 @@ impl Processor for WebBrowser {
                         {
                             return true;
                         }
+                    } else if let Ok(req) = serde_json::to_vec(&WebRequest::FileQuery {
+                        file_id: uuid.to_string(),
+                    }) {
+                        if let Some(location) = self.locate_file(*uuid) {
+                            // check if path to destination has been found else --> start_flood
+                            let _ = self.routing_handler.send_message(&req, location, None);
+                        } else {
+                            for (location, _) in &self.text_servers {
+                                // check if path to destination has been found else --> start_flood
+                                let _ = self.routing_handler.send_message(&req, *location, None);
+                            }
+                        }
                     }
                 }
                 WebCommand::GetTextFiles => {
@@ -168,6 +214,16 @@ impl Processor for WebBrowser {
                         {
                             return true;
                         }
+                    } else if let Ok(req) = serde_json::to_vec(&WebRequest::FileQuery {
+                        file_id: uuid.to_string(),
+                    }) {
+                        if let Some(location) = self.locate_file(*uuid) {
+                            let _ = self.routing_handler.send_message(&req, location, None);
+                        } else {
+                            for (location, _) in &self.text_servers {
+                                let _ = self.routing_handler.send_message(&req, *location, None);
+                            }
+                        }
                     }
                 }
 
@@ -188,9 +244,9 @@ impl Processor for WebBrowser {
                         return true;
                     }
                 }
-                WebCommand::GetMediaFile(uuid) => {
+                WebCommand::GetMediaFile { media_id, location } => {
                     for v in self.cached_files.values() {
-                        if let Some(media) = v.iter().find(|m| m.id == *uuid) {
+                        if let Some(media) = v.iter().find(|m| m.id == *media_id) {
                             if self
                                 .controller_send
                                 .send(Box::new(WebEvent::MediaFile(media.clone())))
@@ -200,6 +256,12 @@ impl Processor for WebBrowser {
                             }
                             break;
                         }
+                    }
+
+                    if let Ok(req) = serde_json::to_vec(&WebRequest::MediaQuery {
+                        media_id: media_id.to_string(),
+                    }) {
+                        let _ = self.routing_handler.send_message(&req, *location, None);
                     }
                 }
                 _ => {
@@ -225,23 +287,13 @@ impl Processor for WebBrowser {
                 }
                 WebResponse::TextFile { file_data } => {
                     if let Ok(file) = serde_json::from_slice::<TextFile>(&file_data) {
-                        for r in &file.get_refs() {
-                            if let Ok(req) = serde_json::to_vec(&WebRequest::MediaQuery {
-                                media_id: r.id.to_string(),
-                            }) {
-                                let _ = self.routing_handler.send_message(
-                                    &req,
-                                    r.get_location(),
-                                    Some(session_id),
-                                );
-                            }
-                        }
-                        let _ = self.cached_files.insert(file, vec![]);
+                        self.manage_text_file(file, session_id);
                     }
                 }
                 WebResponse::MediaFile { media_data } => {
-                    if let Ok(file) = serde_json::from_slice::<MediaFile>(&media_data) {
-                        self.add_media_file(file);
+                    if let Ok(mediafile) = serde_json::from_slice::<MediaFile>(&media_data) {
+                        // check if all media files are present, if yes send to controller
+                        self.manage_media_file(mediafile);
                     }
                 }
 
@@ -258,8 +310,8 @@ impl Processor for WebBrowser {
 #[cfg(test)]
 mod web_browser_tests {
     use super::*;
+    use common::types::{MediaFile, MediaReference, ServerType, TextFile, WebResponse};
     use crossbeam::channel::unbounded;
-    use common::types::{WebResponse, ServerType, TextFile, MediaFile, MediaReference};
 
     fn create_test_web_browser() -> WebBrowser {
         let (controller_send, controller_recv) = unbounded();
@@ -275,7 +327,7 @@ mod web_browser_tests {
         let mut browser = create_test_web_browser();
 
         let response = WebResponse::ServerType {
-            server_type: ServerType::TextServer
+            server_type: ServerType::TextServer,
         };
         let serialized = serde_json::to_vec(&response).unwrap();
         browser.handle_msg(serialized, 5, 100);
@@ -290,7 +342,7 @@ mod web_browser_tests {
 
         let files = vec![
             "file1-id:Article 1".to_string(),
-            "file2-id:Article 2".to_string()
+            "file2-id:Article 2".to_string(),
         ];
         let response = WebResponse::TextFilesList { files };
         let serialized = serde_json::to_vec(&response).unwrap();
@@ -309,11 +361,11 @@ mod web_browser_tests {
         let text_file = TextFile::new(
             "Article with Media".to_string(),
             "Content with media ref".to_string(),
-            vec![media_ref]
+            vec![media_ref],
         );
         let serialized_file = serde_json::to_vec(&text_file).unwrap();
         let response = WebResponse::TextFile {
-            file_data: serialized_file
+            file_data: serialized_file,
         };
         let serialized = serde_json::to_vec(&response).unwrap();
         browser.handle_msg(serialized, 5, 102);
@@ -332,17 +384,17 @@ mod web_browser_tests {
         let text_file = TextFile::new(
             "Article".to_string(),
             "Content".to_string(),
-            vec![media_ref.clone()]
+            vec![media_ref.clone()],
         );
         browser.cached_files.insert(text_file.clone(), vec![]);
         let media_file = MediaFile {
             id: media_ref.id,
             title: "Test Image".to_string(),
-            content: vec![vec![1, 2, 3, 4]]
+            content: vec![vec![1, 2, 3, 4]],
         };
         let serialized_media = serde_json::to_vec(&media_file).unwrap();
         let response = WebResponse::MediaFile {
-            media_data: serialized_media
+            media_data: serialized_media,
         };
         let serialized = serde_json::to_vec(&response).unwrap();
         browser.handle_msg(serialized, 6, 103);
