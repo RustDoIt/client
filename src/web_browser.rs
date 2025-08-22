@@ -4,7 +4,10 @@ use std::{
 };
 
 use common::{
-    types::{File, MediaFile, NodeCommand, ServerType, TextFile, WebCommand, WebEvent, WebRequest, WebResponse},
+    types::{
+        File, MediaFile, NodeCommand, ServerType, TextFile, WebCommand, WebEvent, WebRequest,
+        WebResponse,
+    },
     FragmentAssembler, Processor, RoutingHandler,
 };
 use crossbeam_channel::{Receiver, Sender};
@@ -13,6 +16,8 @@ use wg_internal::{
     network::NodeId,
     packet::{NodeType, Packet},
 };
+
+use crate::errors::ClientError;
 
 type Cache = HashMap<TextFile, Vec<MediaFile>>;
 
@@ -24,8 +29,9 @@ pub struct WebBrowser {
     controller_send: Sender<Box<dyn Any>>,
     packet_recv: Receiver<Packet>,
     assembler: FragmentAssembler,
-    text_servers: HashMap<NodeId, Vec<String>>, // id, file list
+    text_servers: HashMap<NodeId, Vec<String>>, // id, file_list
     cached_files: Cache,
+    pending_request: Option<WebRequest>,
 }
 
 impl WebBrowser {
@@ -49,6 +55,7 @@ impl WebBrowser {
             assembler: FragmentAssembler::default(),
             text_servers: HashMap::new(),
             cached_files: HashMap::new(),
+            pending_request: None,
         }
     }
 
@@ -145,16 +152,27 @@ impl WebBrowser {
         self.controller_send.send(Box::new(event)).is_err()
     }
 
-    fn forward_request(&mut self, req: &WebRequest, uuid: Uuid) {
-        if let Ok(req) = serde_json::to_vec(req) {
-            if let Some(location) = self.locate_file(uuid) {
-                let _ = self.routing_handler.send_message(&req, location, None);
-            } else {
-                for location in self.text_servers.keys() {
-                    let _ = self.routing_handler.send_message(&req, *location, None);
+    // TODO: Create Custom errors (WebBrowserError) of type (NoLocation, SerializeError,
+    // UuidParaseError)
+    fn forward_request(&mut self, req: &WebRequest) -> Result<(), ClientError> {
+        if let Ok(serialized) = serde_json::to_vec(req) {
+            if let Some(uuid) = req.get_file_id() {
+                if let Ok(uuid) = Uuid::parse_str(&uuid) {
+                    if let Some(location) = self.locate_file(uuid) {
+                        let _ = self
+                            .routing_handler
+                            .send_message(&serialized, location, None);
+                        return Ok(());
+                    }
+                    return Err(ClientError::NoLocationError);
                 }
+                return Err(ClientError::UuidParseError);
             }
+        } else {
+            return Err(ClientError::SerializationError);
         }
+
+        Ok(())
     }
 
     fn handle_get_cached_files(&self) -> bool {
@@ -162,11 +180,36 @@ impl WebBrowser {
         self.try_send(WebEvent::CachedFiles(files))
     }
 
+    fn broadcast(&mut self) {
+        if let Some(servers) = self.routing_handler.get_servers() {
+            for s in servers {
+                if let Ok(req) = serde_json::to_vec(&WebRequest::ServerTypeQuery) {
+                    let _ = self.routing_handler.send_message(&req, s, None);
+                }
+            }
+        }
+    }
+
     fn handle_get_file(&mut self, uuid: Uuid) -> bool {
         if let Some(file) = self.get_file(uuid) {
             return self.try_send(WebEvent::File(file));
         }
-        self.forward_request(&WebRequest::FileQuery { file_id: uuid.to_string() }, uuid);
+        match self.forward_request(&WebRequest::FileQuery {
+            file_id: uuid.to_string(),
+        }) {
+            Ok(()) => return false,
+            Err(ClientError::NoLocationError) => {
+                self.broadcast();
+                self.pending_request = Some(WebRequest::FileQuery {
+                    file_id: uuid.to_string(),
+                });
+            }
+            Err(e) => {
+                eprintln!("Error forwarding request: {e}");
+                return false;
+            }
+        }
+
         false
     }
 
@@ -179,7 +222,21 @@ impl WebBrowser {
         if let Some(file) = self.cached_files.keys().find(|f| f.id == uuid) {
             return self.try_send(WebEvent::TextFile(file.clone()));
         }
-        self.forward_request(&WebRequest::FileQuery { file_id: uuid.to_string() }, uuid);
+        match self.forward_request(&WebRequest::FileQuery {
+            file_id: uuid.to_string(),
+        }) {
+            Ok(()) => return false,
+            Err(ClientError::NoLocationError) => {
+                self.broadcast();
+                self.pending_request = Some(WebRequest::FileQuery {
+                    file_id: uuid.to_string(),
+                });
+            }
+            Err(e) => {
+                eprintln!("Error forwarding request: {e}");
+                return false;
+            }
+        }
         false
     }
 
@@ -194,7 +251,6 @@ impl WebBrowser {
                 return self.try_send(WebEvent::MediaFile(media.clone()));
             }
         }
-
         if let Ok(req) = serde_json::to_vec(&WebRequest::MediaQuery {
             media_id: media_id.to_string(),
         }) {
@@ -260,10 +316,20 @@ impl Processor for WebBrowser {
                 WebResponse::ServerType { server_type } => {
                     if matches!(server_type, ServerType::TextServer) {
                         self.text_servers.insert(from, vec![]);
+                        let _ = self.forward_request(&WebRequest::TextFilesListQuery);
                     }
                 }
                 WebResponse::TextFilesList { files } => {
                     self.set_files_list(from, files);
+                    if let Some(req) = self.pending_request.take() {
+                        match self.forward_request(&req) {
+                            Ok(()) => {}
+                            Err(ClientError::NoLocationError) => {
+                                self.pending_request = Some(req);
+                            }
+                            Err(e) => eprintln!("Error forwarding request: {e}"),
+                        }
+                    }
                 }
                 WebResponse::TextFile { file_data } => {
                     if let Ok(file) = serde_json::from_slice::<TextFile>(&file_data) {
