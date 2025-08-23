@@ -1,12 +1,7 @@
-use std::{
-    any::Any,
-    collections::{hash_map::Entry::Vacant, HashMap, HashSet},
-};
-
+use std::collections::{hash_map::Entry::Vacant, HashMap, HashSet};
 use common::{
     types::{
-        File, MediaFile, NodeCommand, ServerType, TextFile, WebCommand, WebEvent, WebRequest,
-        WebResponse,
+        Command, Event, File, MediaFile, NodeCommand, ServerType, TextFile, WebCommand, WebEvent, WebRequest, WebResponse
     },
     FragmentAssembler, Processor, RoutingHandler,
 };
@@ -16,7 +11,6 @@ use wg_internal::{
     network::NodeId,
     packet::{NodeType, Packet},
 };
-
 use crate::errors::ClientError;
 
 type Cache = HashMap<TextFile, Vec<MediaFile>>;
@@ -25,8 +19,8 @@ type Cache = HashMap<TextFile, Vec<MediaFile>>;
 pub struct WebBrowser {
     id: NodeId,
     routing_handler: RoutingHandler,
-    controller_recv: Receiver<Box<dyn Any>>,
-    controller_send: Sender<Box<dyn Any>>,
+    controller_recv: Receiver<Box<dyn Command>>,
+    controller_send: Sender<Box<dyn Event>>,
     packet_recv: Receiver<Packet>,
     assembler: FragmentAssembler,
     text_servers: HashMap<NodeId, Vec<String>>, // id, file_list
@@ -40,8 +34,8 @@ impl WebBrowser {
         id: NodeId,
         neighbors: HashMap<NodeId, Sender<Packet>>,
         packet_recv: Receiver<Packet>,
-        controller_recv: Receiver<Box<dyn Any>>,
-        controller_send: Sender<Box<dyn Any>>,
+        controller_recv: Receiver<Box<dyn Command>>,
+        controller_send: Sender<Box<dyn Event>>,
     ) -> Self {
         let routing_handler =
             RoutingHandler::new(id, NodeType::Client, neighbors, controller_send.clone());
@@ -261,7 +255,7 @@ impl WebBrowser {
 }
 
 impl Processor for WebBrowser {
-    fn controller_recv(&self) -> &Receiver<Box<dyn Any>> {
+    fn controller_recv(&self) -> &Receiver<Box<dyn Command>> {
         &self.controller_recv
     }
 
@@ -277,7 +271,9 @@ impl Processor for WebBrowser {
         &mut self.routing_handler
     }
 
-    fn handle_command(&mut self, cmd: Box<dyn Any>) -> bool {
+    fn handle_command(&mut self, cmd: Box<dyn Command>) -> bool {
+
+        let cmd = cmd.into_any();
         if let Some(cmd) = cmd.downcast_ref::<WebCommand>() {
             match cmd {
                 WebCommand::GetCachedFiles => self.handle_get_cached_files(),
@@ -353,6 +349,8 @@ impl Processor for WebBrowser {
     }
 }
 
+
+
 #[cfg(test)]
 mod web_browser_tests {
     use super::*;
@@ -360,11 +358,12 @@ mod web_browser_tests {
     use crossbeam::channel::unbounded;
 
     fn create_test_web_browser() -> WebBrowser {
-        let (controller_send, controller_recv) = unbounded();
+        let (_controller_send, controller_recv) = unbounded();
+        let (event_send, _event_recv) = unbounded();
         let (_, packet_recv) = unbounded();
         let neighbors = HashMap::new();
 
-        WebBrowser::new(1, neighbors, packet_recv, controller_recv, controller_send)
+        WebBrowser::new(1, neighbors, packet_recv, controller_recv, event_send)
     }
 
     #[test]
@@ -467,8 +466,8 @@ mod web_browser_tests {
         ];
 
         for cmd in commands {
-            let should_continue = browser.handle_command(Box::new(cmd));
-            assert!(!should_continue);
+            let should_not_continue = browser.handle_command(Box::new(cmd));
+            assert!(should_not_continue);
         }
     }
 }
